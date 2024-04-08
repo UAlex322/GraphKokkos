@@ -13,7 +13,7 @@ struct MSA {
     static enum { UNALLOWED = 0, ALLOWED, SET } msa_states;
     char *state;
     T *value;
-    size_t  len;
+    size_t len;
 
     MSA(size_t n) {
         value = new T[n]();
@@ -158,22 +158,22 @@ spMtx<T> transpose(const spMtx<T> &A) {
 
     // filling the column indices array and current column positions array
     for (size_t i = 0; i < A.nz; ++i)
-        ++AT.Rst[A.Col[i]+1];
+        ++AT.Rst(A.Col(i)+1);
     for (size_t i = 0; i < AT.m; ++i)
-        AT.Rst[i+1] += AT.Rst[i];
+        AT.Rst(i+1) += AT.Rst(i);
 
     // transposing
     for (size_t i = 0; i < A.m; ++i) {
-        for (int j = A.Rst[i]; j < A.Rst[i+1]; ++j) {
-            AT.Val[AT.Rst[A.Col[j]]] = std::move(A.Val[j]);
-            AT.Col[AT.Rst[A.Col[j]]++] = i;
+        for (int j = A.Rst(i); j < A.Rst(i+1); ++j) {
+            AT.Val(AT.Rst(A.Col(j))) = std::move(A.Val(j));
+            AT.Col(AT.Rst(A.Col(j))++) = i;
         }
     }
     // set Rst indices to normal state
-    // AT.Rst[AT.m] already has the correct value
+    // AT.Rst(AT.m) already has the correct value
     for (int i = AT.m - 1; i > 0; --i)
-        AT.Rst[i] = AT.Rst[i-1];
-    AT.Rst[0] = 0;
+        AT.Rst(i) = AT.Rst(i-1);
+    AT.Rst(0) = 0;
 
     return AT;
 }
@@ -190,21 +190,23 @@ void fuseEWiseMultAdd(const denseMtx<T> &A, const denseMtx<T> &B, denseMtx<T> &C
 template <typename T, typename U>
 void eWiseMult(const denseMtx<T> &A, const denseMtx<T> &B, const spMtx<U> &M, denseMtx<T> &C) {
     const T zero = T(0);
-#pragma omp parallel for simd
-    for (size_t i = 0; i < C.m; ++i) {
-        T *c_row = C.Val + i * C.n;
+// #pragma omp parallel for simd
+
+    parallel_for("EWiseMult", C.m, KOKKOS_LAMBDA(size_t i) {
         for (size_t j = 0; j < C.n; ++j) {
-            *c_row = zero;
-            ++c_row;
+            C.Val(i * C.n + j) = zero;
         }
-    }
-#pragma omp parallel for schedule(dynamic, 256)
-    for (size_t i = 0; i < M.m; ++i) {
+    });
+
+
+    parallel_for("EWiseMult",
+                 RangePolicy<Schedule<Dynamic>>(0, M.m, ChunkSize(256)),
+                 KOKKOS_LAMBDA(size_t i) {
         for (size_t j = M.Rst[i]; j < M.Rst[i+1]; ++j) {
             size_t idx = C.n * i + M.Col[j];
             C.Val[idx] = A.Val[idx] * B.Val[idx];
         }
-    }
+    });
 }
 
 template <typename T>
@@ -232,8 +234,9 @@ void mxmm_spd(const spMtx<T> &A, const denseMtx<T> &B, const spMtx<U> &M, denseM
     const T zero = T(0);
     // denseMtx<T> BT = transpose(B);
 
-#pragma omp parallel for schedule(dynamic, 256)
-    for (size_t i = 0; i < M.m; ++i) {
+    Kokkos::parallel_for("MaskedSparseDenseGEMM",
+                         Kokkos::RangePolicy<Kokkos::Schedule<Kokkos::Dynamic>>(0, C.m, Kokkos::ChunkSize(256)),
+                         KOKKOS_LAMBDA(size_t i) {
         // for (size_t q = M.Rst[i]; q < M.Rst[i+1]; ++q) {
         //     size_t j = M.Col[q];
         //     T *b_row = BT.Val + BT.n * j;
@@ -243,18 +246,16 @@ void mxmm_spd(const spMtx<T> &A, const denseMtx<T> &B, const spMtx<U> &M, denseM
         //     }
         //     Ccopy.Val[C.n * i + j] = dotpr;
         // }
-        T *c_row = Cbuf.Val + Cbuf.n * i;
-        for (size_t i = 0; i < C.n; ++i)
-            c_row[i] = zero;
-        for (size_t q = A.Rst[i]; q < A.Rst[i+1]; ++q) {
-            size_t j = A.Col[q];
-            T  a_val = A.Val[q];
-            T *b_row = B.Val + B.n * j;
-        #pragma omp simd
-            for (size_t k = M.Rst[i]; k < M.Rst[i+1]; ++k)
-                c_row[M.Col[k]] += a_val * b_row[M.Col[k]];
+        for (size_t j = 0; j < C.n; ++j)
+            Cbuf.Val(i * Cbuf.n + j) = zero;
+        for (size_t q = A.Rst(i); q < A.Rst(i+1); ++q) {
+            size_t j = A.Col(q);
+            T  a_val = A.Val(q);
+        // #pragma omp simd
+            for (size_t k = M.Rst(i); k < M.Rst(i+1); ++k)
+                Cbuf.Val(i * Cbuf.n + M.Col(k)) += a_val * B.Val(j * B.n + M.Col(k));
         }
-    }
+    });
     std::swap(C.Val, Cbuf.Val);
 }
 
@@ -292,29 +293,36 @@ void add_nointersect(const spMtx<T> &A, const spMtx<T> &B, spMtx<T> &C, spMtx<T>
 
     Cbuf.resizeRows(A.m);
     for (size_t i = 0; i <= A.m; ++i)
-        Cbuf.Rst[i] = A.Rst[i] + B.Rst[i];
-    Cbuf.resizeVals(Cbuf.Rst[C.m]);
+        Cbuf.Rst(i) = A.Rst(i) + B.Rst(i);
+    Cbuf.resizeVals(Cbuf.Rst(C.m));
 
-#pragma omp parallel for schedule(dynamic, 64)
-    for (size_t i = 0; i < A.m; ++i) {
-        int aIdx = A.Rst[i], bIdx = B.Rst[i], cIdx;
-        for (cIdx = Cbuf.Rst[i]; aIdx < A.Rst[i+1] && bIdx < B.Rst[i+1]; ++cIdx) {
-            if (A.Col[aIdx] < B.Col[bIdx]) {
-                Cbuf.Col[cIdx] = A.Col[aIdx];
-                Cbuf.Val[cIdx] = A.Val[aIdx++];
-            } else {
-                Cbuf.Col[cIdx] = B.Col[bIdx];
-                Cbuf.Val[cIdx] = B.Val[bIdx++];
+    Kokkos::parallel_for("SparseAddNointersect",
+                         RangePolicy<Schedule<Dynamic>>(0, C.m, ChunkSize(256)),
+                         KOKKOS_LAMBDA(size_t i) {
+        int aIdx = A.Rst(i), bIdx = B.Rst(i), cIdx;
+        for (cIdx = Cbuf.Rst(i); aIdx < A.Rst(i+1) && bIdx < B.Rst(i+1); ++cIdx) {
+            if (A.Col(aIdx) < B.Col(bIdx)) {
+                Cbuf.Col(cIdx) = A.Col(aIdx);
+                Cbuf.Val(cIdx) = A.Val(aIdx++);
+            }
+            else {
+                Cbuf.Col(cIdx) = B.Col(bIdx);
+                Cbuf.Val(cIdx) = B.Val(bIdx++);
             }
         }
         if (aIdx < A.Rst[i+1]) {
-            memcpy(Cbuf.Col + cIdx, A.Col + aIdx, (Cbuf.Rst[i+1] - cIdx) * sizeof(int));
-            memcpy(Cbuf.Val + cIdx, A.Val + aIdx, (Cbuf.Rst[i+1] - cIdx) * sizeof(T));
-        } else {
-            memcpy(Cbuf.Col + cIdx, B.Col + bIdx, (Cbuf.Rst[i+1] - cIdx) * sizeof(int));
-            memcpy(Cbuf.Val + cIdx, B.Val + bIdx, (Cbuf.Rst[i+1] - cIdx) * sizeof(T));
+            for (int j = 0; j < Cbuf.Rst[i+1] - cIdx; ++j) {
+                Cbuf.Col(cIdx + j) = A.Col(aIdx + j);
+                Cbuf.Val(cIdx + j) = A.Val(aIdx + j);
+            }
         }
-    }
+        else {
+            for (int j = 0; j < Cbuf.Rst[i+1] - cIdx; ++j) {
+                Cbuf.Col(cIdx + j) = B.Col(aIdx + j);
+                Cbuf.Val(cIdx + j) = B.Val(aIdx + j);
+            }
+        }
+    });
 
     std::swap(C, Cbuf);
 }
@@ -473,8 +481,8 @@ void mxmm_mca(bool isParallel, const spMtx<T> &A, const spMtx<T> &B, const spMtx
     C.resizeRows(M.m);
     C.resizeVals(M.nz);
     C.n = M.n;
-    memcpy(C.Col, M.Col, C.nz * sizeof(int));
-    memcpy(C.Rst, M.Rst, (C.m + 1) * sizeof(int));
+    Kokkos::deep_copy(C.Col, M.Col);
+    Kokkos::deep_copy(C.Rst, M.Rst);
 
     if (isParallel)
         _mxmm_mca_parallel(A, B, M, C);
@@ -486,8 +494,8 @@ template<typename T, typename U>
 void _mxmm_mca_parallel(const spMtx<T> &A, const spMtx<T> &B, const spMtx<U> &M, spMtx<T> &C) {
     int mca_len = 0;
     for (size_t i = 0; i < A.m; ++i)
-        if (M.Rst[i+1] - M.Rst[i] > mca_len)
-            mca_len = M.Rst[i+1] - M.Rst[i];
+        if (M.Rst(i+1) - M.Rst(i) > mca_len)
+            mca_len = M.Rst(i+1) - M.Rst(i);
 
 #pragma omp parallel
     {
@@ -495,30 +503,25 @@ void _mxmm_mca_parallel(const spMtx<T> &A, const spMtx<T> &B, const spMtx<U> &M,
 
 #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < A.m; ++i) {
-            int m_row_len = M.Rst[i+1] - M.Rst[i];
+            int m_row_len = M.Rst(i+1) - M.Rst(i);
             int m_pos;
 
-            // ùùùùùùù i-ù ùùùùùù ùùùùùùù C
-            for (int t = A.Rst[i]; t < A.Rst[i+1]; ++t) {
-                int k = A.Col[t];
-                int b_pos = B.Rst[k];
-                int b_max = B.Rst[k+1];
-                T   a_val = A.Val[t];
-                // ùùùùùùùùùùù ùùùùùù ù ùùùùùùùùù ùùùùùù ùùùùùùùù ù ùùùùù ùùùùùùùùù
-                m_pos = M.Rst[i];
+            for (int t = A.Rst(i); t < A.Rst(i+1); ++t) {
+                int k = A.Col(t);
+                int b_pos = B.Rst(k);
+                int b_max = B.Rst(k+1);
+                T   a_val = A.Val(t);
+                m_pos = M.Rst(i);
                 for (int j = 0; j < m_row_len; ++j, ++m_pos) {
-                    // ùùùù ùùùùùùùùù ùùùùùùùù ù ùùùùù ùùùùùùù
-                    while (b_pos < b_max && B.Col[b_pos] < M.Col[m_pos])
+                    while (b_pos < b_max && B.Col(b_pos) < M.Col(m_pos))
                         ++b_pos;
-                    // ùùù ùùùùùùùùùù ùùùùùùùùùùù ùùùùùùùù
-                    if (b_pos < b_max && B.Col[b_pos] == M.Col[m_pos])
-                        accum.values[j] += a_val * B.Val[b_pos];
+                    if (b_pos < b_max && B.Col(b_pos) == M.Col(m_pos))
+                        accum.values[j] += a_val * B.Val(b_pos);
                 }
             }
 
-            // ùùùùùùùùùù i-ù ùùùùùù ùùùùùùù C
-            memcpy(C.Val + C.Rst[i], accum.values, m_row_len*sizeof(T));
-            // ùùùùùùù ùùùùùùùùùùùù ùùù ùùùùùùùùù ùùùùùùùù
+            for (size_t j = 0; j < m_row_len; ++j)
+                C.Val(C.Rst(i) + j) = accum.values[j];
             memset(accum.values, 0, mca_len * sizeof(T));
         }
     }
@@ -528,47 +531,41 @@ template<typename T, typename U>
 void _mxmm_mca_sequential(const spMtx<T> &A, const spMtx<T> &B, const spMtx<U> &M, spMtx<T> &C) {
     int mca_len = 0;
     for (size_t i = 0; i < A.m; ++i)
-        if (M.Rst[i+1] - M.Rst[i] > mca_len)
-            mca_len = M.Rst[i+1] - M.Rst[i];
+        if (M.Rst(i+1) - M.Rst(i) > mca_len)
+            mca_len = M.Rst(i+1) - M.Rst(i);
 
     MCA<T> accum(mca_len);
 
     for (size_t i = 0; i < A.m; ++i) {
-        int m_row_len = M.Rst[i+1] - M.Rst[i];
+        int m_row_len = M.Rst(i+1) - M.Rst(i);
         int m_pos;
 
-        // ùùùùùùù i-ù ùùùùùù ùùùùùùù C
-        for (int t = A.Rst[i]; t < A.Rst[i+1]; ++t) {
-            int k = A.Col[t];
-            int b_pos = B.Rst[k];
-            int b_max = B.Rst[k+1];
-            T   a_val = A.Val[t];
-            // ùùùùùùùùùùù ùùùùùù ù ùùùùùùùùù ùùùùùù ùùùùùùùù ù ùùùùù ùùùùùùùùù
-            m_pos = M.Rst[i];
+        for (int t = A.Rst(i); t < A.Rst(i+1); ++t) {
+            int k = A.Col(t);
+            int b_pos = B.Rst(k);
+            int b_max = B.Rst(k+1);
+            T   a_val = A.Val(t);
+            m_pos = M.Rst(i);
             for (int j = 0; j < m_row_len; ++j, ++m_pos) {
-                // ùùùù ùùùùùùùùù ùùùùùùùù ù ùùùùù ùùùùùùù
-                while (b_pos < b_max && B.Col[b_pos] < M.Col[m_pos])
+                while (b_pos < b_max && B.Col(b_pos) < M.Col(m_pos))
                     ++b_pos;
-                // ùùù ùùùùùùùùùù ùùùùùùùùùùù ùùùùùùùù
-                if (b_pos < b_max && B.Col[b_pos] == M.Col[m_pos])
-                    accum.values[j] += a_val * B.Val[b_pos];
+                if (b_pos < b_max && B.Col(b_pos) == M.Col(m_pos))
+                    accum.values[j] += a_val * B.Val(b_pos);
             }
         }
-        // ùùùùùùùùùù i-ù ùùùùùù ùùùùùùù C
-        memcpy(C.Val + C.Rst[i], accum.values, m_row_len*sizeof(T));
-        // ùùùùùùù ùùùùùùùùùùùù ùùù ùùùùùùùùù ùùùùùùùù
+        for (size_t j = 0; j < m_row_len; ++j)
+            C.Val(C.Rst(i) + j) = accum.values[j];
         memset(accum.values, 0, mca_len * sizeof(T));
     }
 }
 
 template<typename T, typename U>
 void mxmm_msa(bool isParallel, const spMtx<T> &A, const spMtx<T> &B, const spMtx<U> &M, spMtx<T> &C) {
-    // ùùùùùùùùùùùùù C
     C.resizeRows(M.m);
     C.resizeVals(M.nz);
     C.n = M.n;
-    memcpy(C.Col, M.Col, C.nz * sizeof(int));
-    memcpy(C.Rst, M.Rst, (C.m + 1) * sizeof(int));
+    Kokkos::deep_copy(C.Col, M.Col);
+    Kokkos::deep_copy(C.Rst, M.Rst);
 
     if (isParallel)
         _mxmm_msa_parallel(A, B, M, C);
@@ -578,28 +575,122 @@ void mxmm_msa(bool isParallel, const spMtx<T> &A, const spMtx<T> &B, const spMtx
 
 template<typename T, typename U>
 void _mxmm_msa_parallel(const spMtx<T> &A, const spMtx<T> &B, const spMtx<U> &M, spMtx<T> &C) {
-    int tile_size = 64;
-    Kokkos::View<T**> accum("Accum", Kokkos::num_threads(), B.n);
-    Kokkos::RangePolicy<Kokkos::Rank<1, Kokkos::Iterate::Left, Kokkos::Iterate::Right>> policy({0}, {A.m}, {tile_size});
-    Kokkos::parallel_for(policy, KOKKOS_LAMBDA(size_t thread_num)) {
-        const T zero = T(0);
-        for (size_t i = 0; i < A.m; ++i) {
-            int m_min = M.Rst(i);
-            int m_max = M.Rst(i+1);
-            for (int j = m_min; j < m_max; ++j)
-                accum(thread_num, M.Col(j)) = zero;
+    // ScratchPadView accum("Accum", total_threads, B.n);
+
+    // DEBUG
+    // std::cout << "A:\n";
+    // A.print_dense();
+    // std::cout << "B:\n";
+    // B.print_dense();
+    // std::cout << "M:\n";
+    // M.print_dense();
+    // std::cout << "C:\n";
+    // C.print_dense();
+    // C.print_crs();
+    const size_t num_of_teams = Kokkos::num_threads();
+    View<int*> work_distribution("", num_of_teams+1);
+    size_t team_i = 1;
+    for (size_t i = 0; i <= A.m; ++i) {
+        if (A.Rst[i] >= A.nz * team_i / num_of_teams)
+            work_distribution(team_i++) = i;
+    }
+    
+    using ScratchPadView =
+        View<T*, Kokkos::DefaultExecutionSpace::scratch_memory_space, Kokkos::MemoryUnmanaged>;
+    int level = 0;
+    TeamPolicy<DefaultExecutionSpace, Schedule<Dynamic>> policy(num_of_teams, Kokkos::AUTO, 64);
+    policy = policy.set_scratch_size(level, Kokkos::PerThread(ScratchPadView::shmem_size(B.n)));
+    // std::cout << ScratchPadView::shmem_size(B.n) << " bytes for accumulator\n";
+    parallel_for("MSpGEMM_MSA", policy, KOKKOS_LAMBDA(const Kokkos::TeamPolicy<>::member_type &team_member) {
+        const size_t team_id = team_member.league_rank();
+        // std::string out = std::to_string(team_id) + " size: " + std::to_string(team_member.team_size()) + "\n";
+        // std::cout << out;
+
+        const size_t team_begin = work_distribution(team_id);
+        const size_t team_end   = work_distribution(team_id + 1);
+        ScratchPadView accum(team_member.thread_scratch(level), B.n);
+        parallel_for(Kokkos::TeamThreadRange(team_member, team_begin, team_end), KOKKOS_LAMBDA(const int i) {
+            const T zero = T(0);
+            const int m_beg = M.Rst(i);
+            const int m_end = M.Rst(i+1);
+            for (int j = m_beg; j < m_end; ++j)
+                accum(M.Col(j)) = zero;
             for (int t = A.Rst(i); t < A.Rst(i+1); ++t) {
-                int k = A.Col(t);
-                int b_pos = B.Rst(k);
-                int b_max = B.Rst(k+1);
+                const int k = A.Col(t);
+                const int b_beg = B.Rst(k);
+                const int b_end = B.Rst(k+1);
                 T   a_val = A.Val(t);
-                for (int j = b_pos; j < b_max; ++j)
-                    accum(thread_num, B.Col(j)) += a_val * B.Val(j);
+                parallel_for(Kokkos::ThreadVectorRange(team_member, b_beg, b_end), KOKKOS_LAMBDA(const int j) {
+                    accum(B.Col(j)) += a_val * B.Val(j);
+                });
+                // for (int j = b_beg; j < b_end; ++j)
+                //     accum(B.Col(j)) += a_val * B.Val(j);
             }
-            for (int j = m_min; j < m_max; ++j)
-                C.Val(j) = accum(thread_num, M.Col(j));
-        }
+            parallel_for(Kokkos::ThreadVectorRange(team_member, m_beg, m_end), KOKKOS_LAMBDA(const int j) {
+                C.Val(j) = accum(M.Col(j));
+            });
+            // for (int j = m_beg; j < m_end; ++j)
+            //     C.Val(j) = accum(M.Col(j));
+        });
     });
+
+    // parallel_for("MSpGEMM_MSA", RangePolicy<Schedule<Dynamic>>(0, C.m, ChunkSize(64)).set_scratch_size(), KOKKOS_LAMBDA(size_t i) {
+    // 
+    //     const T zero = T(0);
+    //     int m_min = M.Rst(i);
+    //     int m_max = M.Rst(i+1);
+    //     for (int j = m_min; j < m_max; ++j)
+    //         accum(thread_id, M.Col(j)) = zero;
+    //     for (int t = A.Rst(i); t < A.Rst(i+1); ++t) {
+    //         int k = A.Col(t);
+    //         int b_pos = B.Rst(k);
+    //         int b_max = B.Rst(k+1);
+    //         T   a_val = A.Val(t);
+    //         for (int j = b_pos; j < b_max; ++j)
+    //             accum(B.Col(j)) += a_val * B.Val(j);
+    //     }
+    //     for (int j = m_min; j < m_max; ++j)
+    //         C.Val(j) = accum(thread_id, M.Col(j));
+    // });
+    // 
+    // Kokkos::parallel_for("MSpGEMM_MSA", Kokkos::RangePolicy<>(0, total_threads), KOKKOS_LAMBDA(size_t thread_id) {
+    //     const T zero = T(0);
+    //     size_t begin = A.m * thread_id / total_threads;
+    //     size_t end = A.m * (thread_id + 1) / total_threads;
+    // 
+    //     // DEBUG
+    //     // std::string output("# " + std::to_string(thread_id) + " entered, job: [" +
+    //     //                    std::to_string(begin) + "; " + std::to_string(end) + ")\n");
+    //     // std::cout << output;
+    //     for (size_t i = begin; i < end; ++i) {
+    //         int m_min = M.Rst(i);
+    //         int m_max = M.Rst(i+1);
+    //         for (int j = m_min; j < m_max; ++j)
+    //             accum(thread_id, M.Col(j)) = zero;
+    //         for (int t = A.Rst(i); t < A.Rst(i+1); ++t) {
+    //             int k = A.Col(t);
+    //             int b_pos = B.Rst(k);
+    //             int b_max = B.Rst(k+1);
+    //             T   a_val = A.Val(t);
+    //             for (int j = b_pos; j < b_max; ++j)
+    //                 accum(thread_id, B.Col(j)) += a_val * B.Val(j);
+    //         }
+    //         for (int j = m_min; j < m_max; ++j)
+    //             C.Val(j) = accum(thread_id, M.Col(j));
+    // 
+    //         // DEBUG
+    //         // C.print_crs();
+    //         // output = "Row " + std::to_string(i) + ": ";
+    //         // std::string out2 = "Accum " + std::to_string(thread_id) + ": (";
+    //         // for (int j = 0; j < B.n; ++j)
+    //         //     out2 += std::to_string(accum(thread_id, j)) + " ";
+    //         // out2 += ")\n";
+    //         // for (int j = m_min; j < m_max; ++j)
+    //         //     output += "(" + std::to_string(C.Col(j)) + ", " +  std::to_string(C.Val(j)) + "), ";
+    //         // output += "\n" + out2;
+    //         // std::cout << output;
+    //     }
+    // });
 }
 
 template<typename T, typename U>
@@ -847,14 +938,8 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
                                  const spMtx<T> &M, spMtx<T> &C) {
     // ùùùùùùùùùùùùù C
     C.m = A.m;
-    if (!C.Col)
-        delete[] C.Col;
-    if (!C.Val)
-        delete[] C.Val;
-    if (!C.Rst)
-        delete[] C.Rst;
-    C.Rst = new int[A.m + 1];
-    C.Rst[0] = 0;
+    C.resizeRows(A.m);
+    C.Rst(0) = 0;
 
     // ùùùùùùùùùù ùùùùùù
     if (isParallel == true) {
@@ -865,14 +950,14 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
 #pragma omp for schedule(dynamic)
             for (size_t i = 0; i < A.m; ++i) {
                 count = 0;
-                for (int k = A.Rst[i]; k < A.Rst[i+1]; ++k)
-                    for (int j = B.Rst[A.Col[k]]; j < B.Rst[A.Col[k] + 1]; ++j)
-                        is_set[B.Col[j]] = 1;
+                for (int k = A.Rst(i); k < A.Rst(i+1); ++k)
+                    for (int j = B.Rst(A.Col(k)); j < B.Rst(A.Col(k) + 1); ++j)
+                        is_set[B.Col(j)] = 1;
                 for (int k = 0; k < A.m; ++k)
                     if (is_set[k])
                         ++count;
                 memset(is_set, 0, A.m*sizeof(char));
-                C.Rst[i+1] = count;
+                C.Rst(i+1) = count;
             }
             delete[] is_set;
         }
@@ -880,17 +965,17 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
         int count = 0;
         char *is_set = new char[A.m]();
         for (size_t i = 0; i < A.m; ++i) {
-            for (int k = A.Rst[i]; k < A.Rst[i+1]; ++k)
-                for (int j = B.Rst[A.Col[k]]; j < B.Rst[A.Col[k] + 1]; ++j)
-                    is_set[B.Col[j]] = 1;
+            for (int k = A.Rst(i); k < A.Rst(i+1); ++k)
+                for (int j = B.Rst(A.Col(k)); j < B.Rst(A.Col(k) + 1); ++j)
+                    is_set[B.Col(j)] = 1;
             for (int k = 0; k < A.m; ++k)
                 if (is_set[k])
                     ++count;
             C.Rst[i+1] = count;
             memset(is_set, 0, A.m*sizeof(char));
         }
-        C.Col = new int[C.Rst[C.m]];
-        C.Val = new T[C.Rst[C.m]];
+        Kokkos::resize(C.Col, C.Rst(C.m));
+        Kokkos::resize(C.Val, C.Rst(C.m));
     }
 
     // ùùùùùùùùù ùùùùùù
@@ -901,17 +986,17 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
             char *is_set = new char[A.m]();
 #pragma omp for schedule(dynamic)
             for (size_t i = 0; i < A.m; ++i) {
-                int c_curr = C.Rst[i];
-                for (int k = A.Rst[i]; k < A.Rst[i+1]; ++k) {
-                    for (int j = B.Rst[A.Col[k]]; j < B.Rst[A.Col[k] + 1]; ++j) {
-                        is_set[B.Col[j]] = 1;
-                        rowpr[B.Col[j]] += A.Val[k] * B.Val[j];
+                int c_curr = C.Rst(i);
+                for (int k = A.Rst(i); k < A.Rst(i+1); ++k) {
+                    for (int j = B.Rst(A.Col(k)); j < B.Rst(A.Col(k) + 1); ++j) {
+                        is_set[B.Col(j)] = 1;
+                        rowpr[B.Col(j)] += A.Val(k) * B.Val(j);
                     }
                 }
                 for (int k = 0; k < A.m; ++k) {
                     if (is_set[k]) {
-                        C.Col[c_curr] = k;
-                        C.Val[c_curr++] = rowpr[k];
+                        C.Col(c_curr) = k;
+                        C.Val(c_curr++) = rowpr[k];
                     }
                 }
                 memset(is_set, 0, A.m*sizeof(char));
@@ -924,17 +1009,17 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
         T *rowpr = new T[A.m]();
         char *is_set = new char[A.m]();
         for (size_t i = 0; i < A.m; ++i) {
-            int c_curr = C.Rst[i];
-            for (int k = A.Rst[i]; k < A.Rst[i+1]; ++k) {
-                for (int j = B.Rst[A.Col[k]]; j < B.Rst[A.Col[k] + 1]; ++j) {
-                    is_set[B.Col[j]] = 1;
-                    rowpr[B.Col[j]] += A.Val[k] * B.Val[j];
+            int c_curr = C.Rst(i);
+            for (int k = A.Rst(i); k < A.Rst(i+1); ++k) {
+                for (int j = B.Rst(A.Col(k)); j < B.Rst(A.Col(k) + 1); ++j) {
+                    is_set[B.Col(j)] = 1;
+                    rowpr[B.Col(j)] += A.Val(k) * B.Val(j);
                 }
             }
             for (int k = 0; k < A.m; ++k) {
                 if (is_set[k]) {
-                    C.Col[c_curr] = k;
-                    C.Val[c_curr++] = rowpr[k];
+                    C.Col(c_curr) = k;
+                    C.Val(c_curr++) = rowpr[k];
                 }
             }
             memset(is_set, 0, A.m*sizeof(char));
@@ -947,36 +1032,37 @@ void mxmm_naive(bool isParallel, const spMtx<T> &A, const spMtx<T> &B,
     // ùùùùùùùùùù ùùùùù
     T *c_wgt_new = new T[M.nz]();
     int *c_adj_new = new int[M.nz];
-    memcpy(c_adj_new, M.Col, M.nz*sizeof(int));
+    for (int i = 0; i < M.nz; ++i)
+        c_adj_new[i] = M.Col(i);
     
     int c_curr;
     if (isParallel == true) {
 #pragma omp parallel for private(c_curr) schedule(dynamic)
         for (size_t i = 0; i < A.m; ++i) {
-            c_curr = C.Rst[i];
-            for (int j = M.Rst[i]; j < M.Rst[i+1]; ++j) {
-                while (c_curr < C.Rst[i+1] && C.Col[c_curr] < M.Col[j])
+            c_curr = C.Rst(i);
+            for (int j = M.Rst(i); j < M.Rst(i+1); ++j) {
+                while (c_curr < C.Rst(i+1) && C.Col(c_curr) < M.Col(j))
                     ++c_curr;
-                if (c_curr < C.Rst[i+1] && C.Col[c_curr] == M.Col[j])
-                    c_wgt_new[j] = C.Val[c_curr++];
+                if (c_curr < C.Rst(i+1) && C.Col(c_curr) == M.Col(j))
+                    c_wgt_new[j] = C.Val(c_curr++);
             }
         }
     } else {
         for (size_t i = 0; i < A.m; ++i) {
-            c_curr = C.Rst[i];
-            for (int j = M.Rst[i]; j < M.Rst[i+1]; ++j) {
-                while (c_curr < C.Rst[i+1] && C.Col[c_curr] < M.Col[j])
+            c_curr = C.Rst(i);
+            for (int j = M.Rst(i); j < M.Rst(i+1); ++j) {
+                while (c_curr < C.Rst(i+1) && C.Col(c_curr) < M.Col(j))
                     ++c_curr;
-                if (c_curr < C.Rst[i+1] && C.Col[c_curr] == M.Col[j])
-                    c_wgt_new[j] = C.Val[c_curr++];
+                if (c_curr < C.Rst(i+1) && C.Col(c_curr) == M.Col(j))
+                    c_wgt_new[j] = C.Val(c_curr++);
             }
         }
     }
 
-    delete[] C.Val;
-    delete[] C.Col;
-    C.Val = c_wgt_new;
-    C.Col = c_adj_new;
-    memcpy(C.Rst, M.Rst, (M.m + 1)*sizeof(int));
-    C.nz = C.Rst[C.m];
+    for (int i = 0; i < M.nz; ++i) {
+        C.Val(i) = c_wgt_new[i];
+        C.Col(i) = c_adj_new[i];
+    }
+    Kokkos::deep_copy(C.Rst, M.Rst);
+    C.nz = C.Rst(C.m);
 }

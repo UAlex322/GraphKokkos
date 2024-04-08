@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.12...3.18)
 project(GraphKokkos LANGUAGES CXX)
 
 if(UNIX)
-    set(CMAKE_CXX_FLAGS "-O3 -std=c++17 -fopenmp")
+    set(CMAKE_CXX_FLAGS "-std=c++2a -fopenmp")
 endif()
 
 find_package(Kokkos REQUIRED)
@@ -17,8 +17,8 @@ add_library(grKokkosLib STATIC
             include/mmio.h
             src/mmio.cpp)
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_options(-g)
-    link_libraries(-g)
+    add_compile_options(-g -fsanitize=address)
+    link_libraries(-g -fsanitize=address)
 endif()
 if (CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3)

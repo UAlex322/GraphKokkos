@@ -12,8 +12,16 @@
 #include <algorithm>
 #include <chrono>
 #include "mmio.h"
-#include <Kokkos_Core.hpp>
 #include <Kokkos_StdAlgorithms.hpp>
+
+using Kokkos::TeamPolicy;
+using Kokkos::DefaultExecutionSpace;
+using Kokkos::View;
+using Kokkos::RangePolicy;
+using Kokkos::Schedule;
+using Kokkos::Dynamic;
+using Kokkos::ChunkSize;
+using Kokkos::parallel_for;
 
 struct GraphInfo {
     std::string graphName;
@@ -50,38 +58,33 @@ public:
             std::cout << "Can't read RMAT from file\n";
             throw "Can't read RMAT from file";
         }
-
-        capacity = nz;
     }
 
     spMtx() {}
 
-    spMtx(size_t _m, size_t _n): m(_m), n(_n) {
-        Kokkos::resize(Rst,m+1);
+    spMtx(size_t _m, size_t _n): m(_m), n(_n), Rst("", m+1) {
     }
 
     spMtx(size_t _m, size_t _n, size_t _nz): m(_m), n(_n), nz(_nz),
-        Rst(m+1), Col(nz), Val(nz) {}
-
-    spMtx(const spMtx &copy): m(copy.m), n(copy.n), nz(copy.nz) {
-        resizeRows(m);
-        resizeVals(nz);
-        Kokkos::deep_copy(Rst, copy.Rst);
-        Kokkos::deep_copy(Col, copy.Col);
-        Kokkos::deep_copy(Val, copy.Val);
-        memcpy(matcode, copy.matcode[i], sizeof(MM_typecode));
+        Rst("", m+1), Col("", nz), Val("", nz) {
     }
 
-    spMtx(spMtx &&mov): m(mov.m), n(mov.n), nz(mov.nz), capacity(mov.capacity) {
+    spMtx(const spMtx &src): m(src.m), n(src.n), nz(src.nz),
+            Rst(src.Rst), Col(src.Col), Val(src.Val) {
+        memcpy(matcode, src.matcode, sizeof(MM_typecode));
+    }
+
+    spMtx(spMtx &&mov): m(mov.m), n(mov.n), nz(mov.nz) {
         std::swap(Col, mov.Col);
         std::swap(Rst, mov.Rst);
         std::swap(Val, mov.Val);
-        memcpy(matcode, mov.matcode[i], sizeof(MM_typecode));
+        memcpy(matcode, mov.matcode, sizeof(MM_typecode));
     }
 
     ~spMtx() {}
 
     void resizeRows(size_t newM) {
+        m = newM;
         Kokkos::resize(Rst, newM+1);
     }
 
@@ -93,47 +96,55 @@ public:
 
     // Копирование структуры матрицы без копирования значений
     template <typename ValT2>
-    void copyPattern(const spMtx<ValT2> &source) {
-        Kokkos::resize(Rst, source.Rst.size());
-        Kokkos::deep_copy(Rst, source.Rst);
-        Kokkos::resize(Col, source.Col.size());
-        Kokkos::deep_copy(Col, source.Col);
-        Kokkos::resize(Val,source.nz);
-        m = source.m;
-        n = source.n;
+    void deep_copy_pattern(const spMtx<ValT2> &src) {
+        Kokkos::resize(Rst, src.Rst.size());
+        Kokkos::deep_copy(Rst, src.Rst);
+        Kokkos::resize(Col, src.Col.size());
+        Kokkos::deep_copy(Col, src.Col);
+        Kokkos::resize(Val, src.nz);
+        m = src.m;
+        n = src.n;
+        nz = src.nz;
     }
 
-    spMtx& operator=(const spMtx &copy) {
-        if (this == &copy)
+    void deep_copy(const spMtx &src) {
+        m = src.m;
+        n = src.n;
+        resizeRows(src.m);
+        resizeVals(src.nz);
+        Kokkos::deep_copy(Rst, src.Rst);
+        Kokkos::deep_copy(Col, src.Col);
+        Kokkos::deep_copy(Val, src.Val);
+        memcpy(matcode, src.matcode, sizeof(MM_typecode));
+    }
+
+    spMtx& operator=(const spMtx &src) {
+        if (this == &src)
             return *this;
 
-        m = copy.m;
-        n  = copy.n;
-        nz = copy.nz;
-
-        resizeRows(m);
-        resizeVals(nz);
-        Kokkos::deep_copy(Rst, copy.Rst);
-        Kokkos::deep_copy(Col, copy.Col);
-        Kokkos::deep_copy(Val, copy.Val);
-        memcpy(matcode, copy.matcode[i], sizeof(MM_typecode));
-
+        m = src.m;
+        n  = src.n;
+        nz = src.nz;
+        Rst = src.Rst;
+        Col = src.Col;
+        Val = src.Val;
+        memcpy(matcode, src.matcode, sizeof(MM_typecode));
 
         return *this;
     }
 
-    spMtx& operator=(spMtx &&mov) {
-        if (this == &mov)
+    spMtx& operator=(spMtx &&src) {
+        if (this == &src)
             return *this;
 
-        m  = mov.m;
-        n  = mov.n;
-        nz = mov.nz;
+        m  = src.m;
+        n  = src.n;
+        nz = src.nz;
 
-        std::swap(Col, mov.Col);
-        std::swap(Rst, mov.Rst);
-        std::swap(Val, mov.Val);
-        memcpy(matcode, mov.matcode[i], sizeof(MM_typecode));
+        std::swap(Col, src.Col);
+        std::swap(Rst, src.Rst);
+        std::swap(Val, src.Val);
+        memcpy(matcode, src.matcode, sizeof(MM_typecode));
 
 
         return *this;
@@ -165,7 +176,7 @@ public:
 
     void print_crs() const {
         std::cout << m << ' ' << nz << '\n';
-        if (Val == nullptr) {
+        if (Val.size() > 0) {
             for (size_t i = 0; i < m; ++i)
                 for (size_t j = Rst(i); j < Rst(i+1); ++j)
                     std::cout << i+1 << ' ' << Col(j)+1 << '\n';
@@ -359,7 +370,7 @@ private:
         Rst(0) = 0;
         for(size_t i = 0; i < m; i++) {
             Rst(i+1) = Rst(i) + edge_num[i];
-            last_el(i) = Rst(i);
+            last_el[i] = Rst(i);
         }
 
         /* Reading file to write it's content in crs */
@@ -523,56 +534,68 @@ private:
 };
 
 template <typename ValT>
+void deep_copy(spMtx<ValT> &dst, const spMtx<ValT> &src) {
+    dst.m = src.m;
+    dst.n = src.n;
+    dst.resizeRows(src.m);
+    dst.resizeVals(src.nz);
+    Kokkos::deep_copy(dst.Rst, src.Rst);
+    Kokkos::deep_copy(dst.Col, src.Col);
+    Kokkos::deep_copy(dst.Val, src.Val);
+    memcpy(dst.matcode, src.matcode, sizeof(MM_typecode));
+}
+
+template <typename ValT>
 class denseMtx {
 public:
     size_t m = 0;
     size_t n = 0;
-    Kokkos::View<ValT> Val;
+    Kokkos::View<ValT*> Val;
 
     denseMtx() {}
 
-    denseMtx(size_t _m, size_t _n) : m(_m), n(_n), Val(m*n) {}
-    denseMtx(const denseMtx &copy) : m(copy.m), n(copy.n), Val(m*n) {
-        Kokkos::deep_copy(Val, copy.Val);
+    denseMtx(size_t _m, size_t _n) : m(_m), n(_n), Val("",m*n) {}
+    denseMtx(const denseMtx &src) : m(src.m), n(src.n), Val(src.Val) {
+        // Kokkos::deep_copy(Val, src.Val);
     }
     denseMtx(denseMtx &&mov) : m(mov.m), n(mov.n) {
         swap(Val, mov.Val);
     }
     template <typename ValT2>
-    denseMtx(const spMtx<ValT2> &copy) : m(copy.m), n(copy.n), Val(m*n) {
+    denseMtx(const spMtx<ValT2> &src) : m(src.m), n(src.n), Val("",m*n) {
 //#pragma omp parallel for schedule(dynamic)
-        for (size_t i = 0; i < copy.m; ++i) {
-            for (size_t k = copy.Rst(i); k < copy.Rst(i+1); ++k) {
-                size_t j = copy.Col(k);
-                Val(i * n + j) = (ValT)(copy.Val(k));
+        for (size_t i = 0; i < src.m; ++i) {
+            for (size_t k = src.Rst(i); k < src.Rst(i+1); ++k) {
+                size_t j = src.Col(k);
+                Val(i * n + j) = (ValT)(src.Val(k));
             }
         }
     }
-    denseMtx& operator=(const denseMtx &copy) {
-        if (this != &copy)
+    denseMtx& operator=(const denseMtx &src) {
+        if (this != &src)
             return *this;
 
-        m = copy.m;
-        n = copy.n;
-        Kokkos::resize(Val, m*n);
-        Kokkos::deep_copy(Val, copy.Val);
+        m = src.m;
+        n = src.n;
+        Val = src.Val;
+        // Kokkos::resize(Val, m*n);
+        // Kokkos::deep_copy(Val, src.Val);
 
         return *this;
     }
     template <typename ValT2>
-    denseMtx& operator=(const spMtx<ValT2> &copy) {
-        m = copy.m;
-        n = copy.n;
+    denseMtx& operator=(const spMtx<ValT2> &src) {
+        m = src.m;
+        n = src.n;
         Kokkos::resize(Val, m*n);
-        Kokkos::deep_copy(Val, copy.Val);
 
 #pragma omp parallel for schedule(dynamic, 512)
-        for (size_t i = 0; i < copy.m; ++i) {
+        for (size_t i = 0; i < src.m; ++i) {
             for (size_t j = 0; j < n; ++j)
                 Val(i*n + j) = ValT();
-            for (int k = copy.Rst(i); k < copy.Rst(i+1); ++k) {
-                size_t j = (size_t)copy.Col(k);
-                Val(i * n + j) = (ValT)(copy.Val(k));
+            for (int k = src.Rst(i); k < src.Rst(i+1); ++k) {
+                size_t j = (size_t)src.Col(k);
+                Val(i * n + j) = (ValT)(src.Val(k));
             }
         }
         return *this;
@@ -580,7 +603,7 @@ public:
     denseMtx& operator=(denseMtx &&mov) {
         m = mov.m;
         n = mov.n;
-        swap(Val, copy.Val);
+        swap(Val, mov.Val);
 
         return *this;
     }
@@ -588,8 +611,7 @@ public:
 
     bool operator==(const denseMtx &B) {
         return m == B.m && n == B.n &&
-            Kokkos::Experimental::equal(Kokkos::DefaultHostExecutionSpace,
-                                        Val, B.Val));
+            Kokkos::Experimental::equal(Kokkos::DefaultHostExecutionSpace(), Val, B.Val);
     }
 
     void resize(size_t newM, size_t newN) {
@@ -608,12 +630,12 @@ public:
 };
 
 template <typename ValT2, typename ValT1>
-spMtx<ValT2> convertType(const spMtx<ValT1> &source) {
+spMtx<ValT2> convertType(const spMtx<ValT1> &src) {
     spMtx<ValT2> result;
 
-    result.copyPattern(source);
-    for (size_t j = 0; j < source.nz; ++j)
-        result.Val(j) = (ValT2)(source.Val(j));
+    result.deep_copy_pattern(src);
+    for (size_t j = 0; j < src.nz; ++j)
+        result.Val(j) = (ValT2)(src.Val(j));
 
     return result;
 }
@@ -631,9 +653,8 @@ spMtx<int> build_adjacency_matrix(const spMtx<T> &Gr) {
     std::memcpy(Res.matcode, Gr.matcode, 4);
     Res.matcode[2] = 'I';
 
-    Kokkos::Experimental::
     for (size_t i = 0; i < Gr.nz; ++i)
-        Res.Val[i] = 1;
+        Res.Val(i) = 1;
 
     return Res;
 }
@@ -680,25 +701,26 @@ spMtx<T> extract_lower_triangle(const spMtx<T> &Gr) {
 
     Res.m = Gr.m;
     Res.n = Gr.n;
-    Res.Rst = new int[Gr.m + 1];
-    Res.Rst[0] = 0;
+    Res.resizeRows(Gr.m);
+    Res.Rst(0) = 0;
 
     for (size_t i = 0; i < Gr.m; ++i) {
-        int r = Gr.Rst[i];
-        while (r < Gr.Rst[i+1] && Gr.Col[r] < i)
+        int r = Gr.Rst(i);
+        while (r < Gr.Rst(i+1) && Gr.Col(r) < i)
             ++r;
-        Res.Rst[i+1] = Res.Rst[i] + (r - Gr.Rst[i]);
+        Res.Rst(i+1) = Res.Rst(i) + (r - Gr.Rst(i));
     }
 
-    Res.nz = Res.Rst[Res.m];
-    Res.Col = new int[Res.nz];
-    Res.Val = new   T[Res.nz];
+    Res.nz = Res.Rst(Res.m);
+    Res.resizeVals(Res.nz);
 
     for (size_t i = 0; i < Gr.m; ++i) {
-        size_t row_len = Res.Rst[i+1] - Res.Rst[i];
-        std::memcpy(Res.Col + Res.Rst[i], Gr.Col + Gr.Rst[i], row_len*sizeof(int));
-        std::memcpy(Res.Val + Res.Rst[i], Gr.Val + Gr.Rst[i], row_len*sizeof(T));
-    }
+        size_t row_len = Res.Rst(i+1) - Res.Rst(i);
+        for (size_t j = 0; j < row_len; ++j) {
+            Res.Col(Res.Rst(i) + j) = Gr.Col(Gr.Rst(i) + j);
+            Res.Val(Res.Rst(i) + j) = Gr.Val(Gr.Rst(i) + j);
+        }
+    }   
     
     return Res;
 }

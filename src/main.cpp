@@ -41,8 +41,10 @@ int* triangle_counting_vertex(const spMtx<int> &A, mxmOp<int> matrixMult, bool i
 
 int64_t triangle_counting_masked_lu(const spMtx<int> &A, mxmOp<int> matrixMult, bool isParallel) {
     int64_t num_of_tr = 0;
-    spMtx<int> L = extract_lower_triangle(A);
-    spMtx<int> U = transpose(L);
+    spMtx<int> L = std::move(extract_lower_triangle(A));
+    // spMtx<int> L;
+    // deep_copy(L, extract_lower_triangle(A));
+    spMtx<int> U = std::move(transpose(L));
     spMtx<int> C;
 
     auto start = chrono::steady_clock::now();
@@ -51,8 +53,8 @@ int64_t triangle_counting_masked_lu(const spMtx<int> &A, mxmOp<int> matrixMult, 
     matrixMult(isParallel, L, U, A, C);
 
     // Count the total number of triangles
-    for (int j = 0; j < C.Rst[C.m]; ++j)
-        num_of_tr += C.Val[j];
+    for (int j = 0; j < C.Rst(C.m); ++j)
+        num_of_tr += C.Val(j);
     num_of_tr >>= 1;
     /* TRIANGLE COUNTING ITSELF */
 
@@ -66,7 +68,7 @@ int64_t triangle_counting_masked_lu(const spMtx<int> &A, mxmOp<int> matrixMult, 
 
 int64_t triangle_counting_masked_sandia(const spMtx<int> &A, mxmOp<int> matrixMult, bool isParallel) {
     int64_t num_of_tr = 0;
-    spMtx<int> L = extract_lower_triangle(A);
+    spMtx<int> L = std::move(extract_lower_triangle(A));
     spMtx<int> C;
 
     auto start = chrono::steady_clock::now();
@@ -75,9 +77,9 @@ int64_t triangle_counting_masked_sandia(const spMtx<int> &A, mxmOp<int> matrixMu
     matrixMult(isParallel, L, L, L, C);
 
     // Count the total number of triangles
-#pragma omp parallel for reduction(+:num_of_tr)
-    for (int j = 0; j < C.Rst[C.m]; ++j)
-        num_of_tr += C.Val[j];
+    Kokkos::parallel_reduce("", C.nz, KOKKOS_LAMBDA(int64_t i, int64_t& sum) {
+        sum += C.Val(i);
+    }, Kokkos::Sum<int64_t>(num_of_tr));
     /* TRIANGLE COUNTING ITSELF */
 
     auto finish = chrono::steady_clock::now();
@@ -94,8 +96,8 @@ spMtx<int> k_truss(const spMtx<int> &A, int k, mxmOp<int> matrixMult, bool isPar
     spMtx<int> Tmp;
     int n = A.m;
     int totalIterationNum = 0;
-    int *tmp_Xdj = new int[n+1];
-    tmp_Xdj[0] = 0;
+    Kokkos::View<int*> tmp_Xdj("", n);
+    tmp_Xdj(0) = 0;
 
     auto start = chrono::steady_clock::now();
 
@@ -107,16 +109,16 @@ spMtx<int> k_truss(const spMtx<int> &A, int k, mxmOp<int> matrixMult, bool isPar
         // and replace values of remaining entries with 1
         int new_curr_pos = 0;
         for (int i = 0; i < n; ++i) {
-            for (int j = Tmp.Rst[i]; j < Tmp.Rst[i+1]; ++j) {
-                if (Tmp.Val[j] >= k-2) {
-                    Tmp.Col[new_curr_pos]   = Tmp.Col[j];
-                    Tmp.Val[new_curr_pos++] = 1;
+            for (int j = Tmp.Rst(i); j < Tmp.Rst(i+1); ++j) {
+                if (Tmp.Val(j) >= k-2) {
+                    Tmp.Col(new_curr_pos)   = Tmp.Col[j];
+                    Tmp.Val(new_curr_pos++) = 1;
                 }
             }
-            tmp_Xdj[i+1] = new_curr_pos;
+            tmp_Xdj(i+1) = new_curr_pos;
         }
-        memcpy(Tmp.Rst, tmp_Xdj, (n+1)*sizeof(int));
-        Tmp.nz = Tmp.Rst[n];
+        Kokkos::deep_copy(Tmp.Rst, tmp_Xdj);
+        Tmp.nz = Tmp.Rst(n);
 
         // check if the number of edges has changed
         if (Tmp.nz == C.nz) {
@@ -128,27 +130,18 @@ spMtx<int> k_truss(const spMtx<int> &A, int k, mxmOp<int> matrixMult, bool isPar
         std::swap(C, Tmp);
     }
 
+    Kokkos::resize(C.Col, C.nz);
+    Kokkos::resize(C.Val, C.nz);
+
     auto finish = chrono::steady_clock::now();
     cout << "Time:       " << chrono::duration_cast<chrono::milliseconds>(finish - start).count() << " ms\n";
     cout << "Iterations: " << totalIterationNum << '\n';
 
-    if (C.nz < A.nz) {
-        int *new_Adj = new int[C.nz];
-        int *new_Wgt = new int[C.nz];
-        std::memcpy(new_Adj, C.Col, C.nz * sizeof(int));
-        std::memcpy(new_Wgt, C.Val, C.nz * sizeof(int));
-        delete[] C.Col;
-        delete[] C.Val;
-        C.Col = new_Adj;
-        C.Val = new_Wgt;
-    }
-
-    delete[] tmp_Xdj;
     return C;
 }
 
 
-GraphInfo get_graph_info(int argc, const char *argv[]) {
+GraphInfo get_graph_info(int argc, char *argv[]) {
     std::time_t current_time = chrono::system_clock::to_time_t(chrono::system_clock::now());
     string current_date_time(ctime(&current_time));
     string graphName;
@@ -187,7 +180,7 @@ GraphInfo get_graph_info(int argc, const char *argv[]) {
     return info;
 }
 
-int launch_test(const spMtx<int> &gr, const GraphInfo &info, int argc, const char *argv[]) {
+int launch_test(const spMtx<int> &gr, const GraphInfo &info, int argc, char *argv[]) {
     string benchmarkAlgorithm(argv[4]),
            parOrSeq(argv[5]),
            batchSizeStr;
@@ -219,7 +212,7 @@ int launch_test(const spMtx<int> &gr, const GraphInfo &info, int argc, const cha
     }
 
     if (benchmarkAlgorithm != "bc")
-        TestMtx = build_symm_from_lower(extract_lower_triangle(TestMtx));
+        TestMtx = std::move(build_symm_from_lower(extract_lower_triangle(TestMtx)));
 
     if (parOrSeq == "par") {
         alg_ss << "Parallel,   " << omp_get_max_threads() << " threads\n";
@@ -250,7 +243,7 @@ int launch_test(const spMtx<int> &gr, const GraphInfo &info, int argc, const cha
         triangle_counting_masked_sandia(TestMtx, mxm_algorithm, isParallel);
     }
     else if (benchmarkAlgorithm == "bc") {
-        Kokkos::View<float*> bcVector;
+        std::vector<float> bcVector;
         // size_t cache_fit_size = 1747626; // to size of float matrix to fit into 20 Mb cache 
         // size_t batch_size = (cache_fit_size/Adj.m > 0) ? cache_fit_size/Adj.m : 3;
         start = chrono::high_resolution_clock::now();
@@ -259,7 +252,7 @@ int launch_test(const spMtx<int> &gr, const GraphInfo &info, int argc, const cha
         // bcVector = betweenness_centrality(isParallel, TestMtx, 5);
         float sum = 0.0f;
         for (size_t i = 0; i < bcVector.size(); ++i)
-            sum += bcVector(i);
+            sum += bcVector[i];
         // for (size_t i = 0; i < bcVector.size(); ++i)
         //     cout << bcVector[i] << '\n';
         
@@ -314,18 +307,18 @@ string get_graph_val_type(const char *filename, const GraphInfo &info) {
     return stype;
 }
 
-// argv[1] - ����
-// argv[2] - ����� ��� ������ �����
-// argv[3] - ����������� �������� (tobinary / launch)
-// ��� 'launch':
-//   argv[4] - ����������� �������� (triangle / k-truss / mxm / bc)
-//   argv[5] - ��������������� ��� ����������� (seq / par)
-//   ��� 'bc':
-//     argv[6] - batch size (����� ������, ��� ������� ����������� ��������)
-//   ��� 'triangle' / 'k-truss' / 'mxm':
-//     argv[6] - ������������ �������� ��������� (naive / msa / mca / heap)
-//     ��� k-truss:
-//       argv[7] - �������� 'k' � k-truss
+// argv[1] - path to graph
+// argv[2] - path to log folder
+// argv[3] - action (tobinary / launch)
+// if 'launch':
+//   argv[4] - algorithm to execute (triangle / k-truss / mxm / bc)
+//   argv[5] - parallelism mode (seq / par)
+//   if 'bc':
+//     argv[6] - batch size (how many vertices are used to compute dependencies in BC)
+//   if 'triangle' / 'k-truss' / 'mxm':
+//     argv[6] - accumulator to use in algorithm (naive / msa / mca / heap)
+//     if k-truss:
+//       argv[7] - parameter 'k' in k-truss
 
 template <typename ValType>
 int read_graph_and_launch_test(const GraphInfo &info, int argc, char *argv[]) {
